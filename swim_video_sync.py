@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -45,6 +45,21 @@ class RoleDetection:
     score_a: float
     score_b: float
     reason: str
+
+
+@dataclass
+class VideoCandidate:
+    path: Path
+    timestamp: datetime
+    stem: str
+
+
+@dataclass
+class VideoPair:
+    video_a: Path
+    video_b: Path
+    delta_minutes: float
+    pair_name: str
 
 
 class PersonSegmenter:
@@ -212,6 +227,66 @@ def detect_video_roles(video_a: Path, video_b: Path) -> RoleDetection:
         score_b=float(score_b),
         reason=reason,
     )
+
+
+def parse_video_timestamp(path: Path) -> datetime:
+    stem = path.stem
+    for fmt in ("%Y%m%d_%H%M%S", "%Y%m%d_%H%M"):
+        try:
+            return datetime.strptime(stem, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"无法从文件名解析时间，期望类似 20210627_1231.mp4: {path.name}")
+
+
+def collect_video_candidates(folder: Path) -> list[VideoCandidate]:
+    candidates: list[VideoCandidate] = []
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in {".mp4", ".mov", ".mkv"}:
+            continue
+        candidates.append(
+            VideoCandidate(
+                path=path,
+                timestamp=parse_video_timestamp(path),
+                stem=path.stem,
+            )
+        )
+    if not candidates:
+        raise ValueError(f"目录下没有可处理视频: {folder}")
+    return candidates
+
+
+def pair_videos_by_nearest_time(
+    camera_a_dir: Path,
+    camera_b_dir: Path,
+    max_delta_minutes: float,
+) -> list[VideoPair]:
+    candidates_a = collect_video_candidates(camera_a_dir)
+    candidates_b = collect_video_candidates(camera_b_dir)
+    remaining_b = candidates_b.copy()
+    pairs: list[VideoPair] = []
+
+    for item_a in candidates_a:
+        if not remaining_b:
+            break
+        best = min(
+            remaining_b,
+            key=lambda item_b: abs((item_a.timestamp - item_b.timestamp).total_seconds()),
+        )
+        delta_minutes = abs((item_a.timestamp - best.timestamp).total_seconds()) / 60.0
+        if delta_minutes > max_delta_minutes:
+            continue
+        remaining_b.remove(best)
+        pair_name = f"{item_a.stem}__{best.stem}"
+        pairs.append(
+            VideoPair(
+                video_a=item_a.path,
+                video_b=best.path,
+                delta_minutes=delta_minutes,
+                pair_name=pair_name,
+            )
+        )
+    return pairs
 
 
 def iter_sampled_frames(
@@ -658,6 +733,155 @@ def write_fused_video(
     bottom_reader.close()
 
 
+def run_alignment_and_fusion(
+    *,
+    top_video: Path,
+    bottom_video: Path,
+    output_dir: Path,
+    sample_fps: float,
+    anchor_step_sec: float,
+    window_sec: float,
+    search_radius_sec: float,
+    waterline_ratio: float,
+    blend_px: int,
+    output_fps: float,
+    max_output_width: int,
+    use_person_segmentation: bool,
+    skip_fuse: bool,
+    role_detection: RoleDetection | None = None,
+    report_filename: str = "alignment_report.json",
+    fused_video_filename: str = "fused_swim.mp4",
+) -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    top_meta = load_video_meta(top_video)
+    bottom_meta = load_video_meta(bottom_video)
+
+    top_ts, top_sig = build_signature_timeline(top_video, sample_fps=sample_fps, underwater=False)
+    bottom_ts, bottom_sig = build_signature_timeline(bottom_video, sample_fps=sample_fps, underwater=True)
+
+    global_offset = global_offset_from_signatures(
+        ts_a=top_ts,
+        sig_a=top_sig,
+        ts_b=bottom_ts,
+        sig_b=bottom_sig,
+        sample_fps=sample_fps,
+    )
+    anchors = refine_alignment_points(
+        ts_a=top_ts,
+        sig_a=top_sig,
+        ts_b=bottom_ts,
+        sig_b=bottom_sig,
+        base_offset_sec=global_offset,
+        anchor_step_sec=anchor_step_sec,
+        window_sec=window_sec,
+        search_radius_sec=search_radius_sec,
+        sample_fps=sample_fps,
+    )
+    total_duration = min(top_meta.duration, bottom_meta.duration)
+    curve_times, curve_offsets = smooth_offsets(anchors, total_duration=total_duration)
+
+    report_path = output_dir / report_filename
+    save_alignment_report(
+        output_path=report_path,
+        top_meta=top_meta,
+        bottom_meta=bottom_meta,
+        global_offset=global_offset,
+        anchors=anchors,
+        curve_times=curve_times,
+        curve_offsets=curve_offsets,
+        role_detection=role_detection,
+    )
+
+    output_video_path = output_dir / fused_video_filename
+    if not skip_fuse:
+        write_fused_video(
+            top_path=top_video,
+            bottom_path=bottom_video,
+            top_meta=top_meta,
+            bottom_meta=bottom_meta,
+            output_path=output_video_path,
+            curve_times=curve_times,
+            curve_offsets=curve_offsets,
+            waterline_ratio=waterline_ratio,
+            blend_px=blend_px,
+            output_fps=output_fps,
+            max_output_width=max_output_width,
+            use_person_segmentation=use_person_segmentation,
+        )
+
+    return {
+        "top_video_path": str(top_video),
+        "bottom_video_path": str(bottom_video),
+        "global_offset_sec": global_offset,
+        "anchor_count": len(anchors),
+        "report_path": str(report_path),
+        "fused_video_path": str(output_video_path) if not skip_fuse else None,
+    }
+
+
+def run_batch_processing(args: argparse.Namespace) -> dict[str, object]:
+    if not args.batch_video_root:
+        raise ValueError("批处理模式缺少 --batch-video-root")
+
+    root = args.batch_video_root
+    camera_dirs = sorted([p for p in root.iterdir() if p.is_dir() and p.name != args.batch_output_dir_name])
+    if len(camera_dirs) != 2:
+        raise ValueError(f"批处理模式要求根目录下恰好有两个相机子目录，当前找到: {[p.name for p in camera_dirs]}")
+
+    pairs = pair_videos_by_nearest_time(
+        camera_a_dir=camera_dirs[0],
+        camera_b_dir=camera_dirs[1],
+        max_delta_minutes=args.max_pair_delta_minutes,
+    )
+    if not pairs:
+        raise ValueError("没有找到可配对的视频，请检查文件名时间格式或放宽最大配对时间差。")
+
+    fusion_root = root / args.batch_output_dir_name
+    fusion_root.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, object]] = []
+    for pair in pairs:
+        role_detection = detect_video_roles(pair.video_a, pair.video_b)
+        top_video = Path(role_detection.top_path)
+        bottom_video = Path(role_detection.underwater_path)
+        result = run_alignment_and_fusion(
+            top_video=top_video,
+            bottom_video=bottom_video,
+            output_dir=fusion_root,
+            sample_fps=args.sample_fps,
+            anchor_step_sec=args.anchor_step_sec,
+            window_sec=args.window_sec,
+            search_radius_sec=args.search_radius_sec,
+            waterline_ratio=args.waterline_ratio,
+            blend_px=args.blend_px,
+            output_fps=args.output_fps,
+            max_output_width=args.max_output_width,
+            use_person_segmentation=not args.disable_person_segmentation,
+            skip_fuse=args.skip_fuse,
+            role_detection=role_detection,
+            report_filename=f"{pair.pair_name}_alignment_report.json",
+            fused_video_filename=f"{pair.pair_name}.mp4",
+        )
+        results.append(
+            {
+                "pair_name": pair.pair_name,
+                "delta_minutes": pair.delta_minutes,
+                "camera_a_video": str(pair.video_a),
+                "camera_b_video": str(pair.video_b),
+                **result,
+            }
+        )
+
+    summary_path = fusion_root / "batch_summary.json"
+    summary_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "pair_count": len(results),
+        "fusion_root": str(fusion_root),
+        "summary_path": str(summary_path),
+        "pairs": results,
+    }
+
+
 def save_alignment_report(
     output_path: Path,
     top_meta: VideoMeta,
@@ -693,6 +917,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bottom-video", type=Path, help="显式指定水下视角视频路径")
     parser.add_argument("--video-a", type=Path, help="未区分机位的第一个视频，脚本会自动判断")
     parser.add_argument("--video-b", type=Path, help="未区分机位的第二个视频，脚本会自动判断")
+    parser.add_argument("--batch-video-root", type=Path, help="批处理根目录，内部应包含两个相机子目录")
+    parser.add_argument("--batch-output-dir-name", type=str, default="融合", help="批处理输出目录名，默认在根目录下创建“融合”文件夹")
+    parser.add_argument("--max-pair-delta-minutes", type=float, default=10.0, help="批处理时允许配对的最大时间差（分钟）")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="输出目录")
     parser.add_argument("--sample-fps", type=float, default=6.0, help="对齐分析采样帧率")
     parser.add_argument("--anchor-step-sec", type=float, default=5.0, help="局部微调锚点间隔")
@@ -713,87 +940,39 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    role_detection = None
-    if args.video_a and args.video_b:
-        role_detection = detect_video_roles(args.video_a, args.video_b)
-        top_video = Path(role_detection.top_path)
-        bottom_video = Path(role_detection.underwater_path)
-    elif args.top_video and args.bottom_video:
-        top_video = args.top_video
-        bottom_video = args.bottom_video
+    if args.batch_video_root:
+        result = run_batch_processing(args)
     else:
-        raise ValueError("请提供 --video-a/--video-b 让脚本自动识别，或提供 --top-video/--bottom-video 显式指定。")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        role_detection = None
+        if args.video_a and args.video_b:
+            role_detection = detect_video_roles(args.video_a, args.video_b)
+            top_video = Path(role_detection.top_path)
+            bottom_video = Path(role_detection.underwater_path)
+        elif args.top_video and args.bottom_video:
+            top_video = args.top_video
+            bottom_video = args.bottom_video
+        else:
+            raise ValueError("请提供 --batch-video-root 批处理，或提供 --video-a/--video-b 自动识别，或提供 --top-video/--bottom-video 显式指定。")
 
-    top_meta = load_video_meta(top_video)
-    bottom_meta = load_video_meta(bottom_video)
-
-    top_ts, top_sig = build_signature_timeline(top_video, sample_fps=args.sample_fps, underwater=False)
-    bottom_ts, bottom_sig = build_signature_timeline(bottom_video, sample_fps=args.sample_fps, underwater=True)
-
-    global_offset = global_offset_from_signatures(
-        ts_a=top_ts,
-        sig_a=top_sig,
-        ts_b=bottom_ts,
-        sig_b=bottom_sig,
-        sample_fps=args.sample_fps,
-    )
-    anchors = refine_alignment_points(
-        ts_a=top_ts,
-        sig_a=top_sig,
-        ts_b=bottom_ts,
-        sig_b=bottom_sig,
-        base_offset_sec=global_offset,
-        anchor_step_sec=args.anchor_step_sec,
-        window_sec=args.window_sec,
-        search_radius_sec=args.search_radius_sec,
-        sample_fps=args.sample_fps,
-    )
-    total_duration = min(top_meta.duration, bottom_meta.duration)
-    curve_times, curve_offsets = smooth_offsets(anchors, total_duration=total_duration)
-
-    report_path = args.output_dir / "alignment_report.json"
-    save_alignment_report(
-        output_path=report_path,
-        top_meta=top_meta,
-        bottom_meta=bottom_meta,
-        global_offset=global_offset,
-        anchors=anchors,
-        curve_times=curve_times,
-        curve_offsets=curve_offsets,
-        role_detection=role_detection,
-    )
-
-    if not args.skip_fuse:
-        output_video_path = args.output_dir / "fused_swim.mp4"
-        write_fused_video(
-            top_path=top_video,
-            bottom_path=bottom_video,
-            top_meta=top_meta,
-            bottom_meta=bottom_meta,
-            output_path=output_video_path,
-            curve_times=curve_times,
-            curve_offsets=curve_offsets,
+        result = run_alignment_and_fusion(
+            top_video=top_video,
+            bottom_video=bottom_video,
+            output_dir=args.output_dir,
+            sample_fps=args.sample_fps,
+            anchor_step_sec=args.anchor_step_sec,
+            window_sec=args.window_sec,
+            search_radius_sec=args.search_radius_sec,
             waterline_ratio=args.waterline_ratio,
             blend_px=args.blend_px,
             output_fps=args.output_fps,
             max_output_width=args.max_output_width,
             use_person_segmentation=not args.disable_person_segmentation,
+            skip_fuse=args.skip_fuse,
+            role_detection=role_detection,
         )
 
-    print(json.dumps(
-        {
-            "top_video_path": str(top_video),
-            "bottom_video_path": str(bottom_video),
-            "global_offset_sec": global_offset,
-            "anchor_count": len(anchors),
-            "report_path": str(report_path),
-            "fused_video_path": str(args.output_dir / "fused_swim.mp4") if not args.skip_fuse else None,
-        },
-        ensure_ascii=False,
-        indent=2,
-    ))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

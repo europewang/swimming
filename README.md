@@ -78,6 +78,20 @@ python -X utf8 .\swim_video_sync.py `
   --output-dir .\outputs
 ```
 
+批量处理 `video` 根目录下的两个相机文件夹时：
+
+```powershell
+python -X utf8 .\swim_video_sync.py `
+  --batch-video-root .\video
+```
+
+脚本会：
+
+- 自动扫描 `video` 下的两个相机子目录
+- 根据文件名时间戳按“最近时间”自动配对
+- 自动识别每组里的水上 / 水下视频
+- 直接把每一组的融合视频和报告放到 `video\融合`
+
 如果你已经明确知道谁是水上、谁是水下，也可以显式指定：
 
 ```powershell
@@ -95,6 +109,17 @@ python -X utf8 .\swim_video_sync.py `
   --video-b "path\to\video_b.mp4" `
   --output-dir .\outputs `
   --skip-fuse
+```
+
+如果你在批处理模式下加了 `--skip-fuse`，脚本只会生成配对结果和 `alignment_report`，不会生成 `.mp4` 视频。
+
+要真正生成融合视频，请不要加 `--skip-fuse`：
+
+```powershell
+python -X utf8 .\swim_video_sync.py `
+  --batch-video-root .\video `
+  --output-fps 15 `
+  --max-output-width 1280
 ```
 
 ## 关键参数
@@ -117,6 +142,15 @@ python -X utf8 .\swim_video_sync.py `
 - `--max-output-width 1280`
   先缩小到这个宽度再融合，适合 4K 素材做快速测试。
 
+- `--max-pair-delta-minutes 10`
+  批处理配对时允许的最大时间差，单位分钟。
+
+- `--output-fps 15`
+  输出视频帧率，越高越流畅，但处理更慢。
+
+- `--disable-person-segmentation`
+  禁用 YOLO 人体分割，仅使用传统图像法。一般不建议默认加。
+
 ## 输出内容
 
 - `outputs/alignment_report.json`
@@ -124,6 +158,17 @@ python -X utf8 .\swim_video_sync.py `
 
 - `outputs/fused_swim.mp4`
   上下融合后的结果视频。
+
+批处理时还会额外输出：
+
+- `video\融合\batch_summary.json`
+  记录整批配对和输出结果。
+
+- `video\融合\<配对名>.mp4`
+  每组视频的融合结果，直接平铺在 `融合` 文件夹里。
+
+- `video\融合\<配对名>_alignment_report.json`
+  每组视频的时间对齐报告，也直接平铺在 `融合` 文件夹里。
 
 ## 你下一步最值得做的两件事
 
