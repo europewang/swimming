@@ -1,0 +1,7 @@
+video/
+__pycache__/
+*.py[cod]
+debug_frames/
+debug_masks/
+outputs*/
+yolov8n-seg.pt
