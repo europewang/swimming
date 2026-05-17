@@ -1,7 +1,12 @@
 video/
+outputs_v2/
+outputs_single/
 __pycache__/
 *.py[cod]
 debug_frames/
 debug_masks/
 outputs*/
+video_merge/
+*.png
+*.wav
 yolov8n-seg.pt
