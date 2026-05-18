@@ -51,10 +51,10 @@ except ImportError:
 # ============================================================
 # 融合参数配置
 # ============================================================
-TOP_ZOOM_FACTOR = 1.2             # 水上视频全局放大倍率（拉近镜头，主体更大）
-TOP_WATERLINE_OFFSET = 20         # 针对水上视频：将水线向下扩展的像素大小（展示更多人物上半身）
-BOTTOM_WATERLINE_OFFSET = 20      # 针对水下视频：将水线向上扩展的像素大小（展示更多人物下半身）
-FEATHER_PX = 20                    # 融合羽化宽度（在新拓展的重合带内进行过渡，0为硬切，不占有已有内容）
+TOP_ZOOM_FACTOR = 1.15             # 水上视频全局放大倍率（拉近镜头，主体更大）
+TOP_WATERLINE_OFFSET = 10         # 针对水上视频：将水线向下扩展的像素大小（展示更多人物上半身）
+BOTTOM_WATERLINE_OFFSET = 10      # 针对水下视频：将水线向上扩展的像素大小（展示更多人物下半身）
+FEATHER_PX = 40                    # 融合羽化宽度（在新拓展的重合带内进行过渡，0为硬切，不占有已有内容）
 BLUE, GREEN, RED, YELLOW = (0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)
 
 @dataclass
@@ -259,24 +259,6 @@ def find_underwater_reflection_axis(frame: np.ndarray) -> int | None:
         if score > best_score: best_score, best_row = score, r
     return int(round(best_row * h / hs)) if best_row else None
 
-def compute_waterline_edge_profile(frame: np.ndarray, waterline_row: int, strip_height: int = 12) -> np.ndarray:
-    h, w = frame.shape[:2]
-    strip = frame[max(0, waterline_row - strip_height):min(h, waterline_row + strip_height), :]
-    edge = np.abs(cv2.Sobel(cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY).astype(np.float64), cv2.CV_64F, 1, 0, ksize=3)).mean(axis=0)
-    return gaussian_filter(edge, sigma=1.5)
-
-def find_horizontal_offset_by_edge_correlation(top_frame: np.ndarray, bot_frame: np.ndarray, top_wl: int, bot_wl: int) -> float:
-    if top_frame.shape[1] != bot_frame.shape[1]: return 0.0
-    prof_t = compute_waterline_edge_profile(top_frame, top_wl)
-    prof_b = compute_waterline_edge_profile(bot_frame, bot_wl)
-    if len(prof_t) < 10 or len(prof_b) < 10: return 0.0
-    min_len = min(len(prof_t), len(prof_b))
-    corr = fftconvolve(prof_b[:min_len], prof_t[:min_len][::-1], mode='full')
-    mid = min_len - 1
-    search_l, search_r = max(0, mid - 80), min(len(corr) - 1, mid + 80)
-    if search_r <= search_l: return 0.0
-    return float(int(np.argmax(corr[search_l:search_r + 1])) + search_l - mid)
-
 def get_motion_x_centroid(frame: np.ndarray, bg: np.ndarray) -> float | None:
     if frame.shape != bg.shape: bg = cv2.resize(bg, (frame.shape[1], frame.shape[0]))
     diff = cv2.cvtColor(cv2.absdiff(frame, bg), cv2.COLOR_RGB2GRAY)
@@ -345,20 +327,103 @@ def score_fused_body_similarity(fused: np.ndarray, seam_y: int) -> float:
     if search_r <= search_l: return 0.0
     return float(np.max(corr[search_l:search_r + 1])) * 0.85 + (1.0 / (1.0 + float(np.std(fused[seam_y] if seam_y < h else fused[-1])) / 10.0)) * 15.0
 
-def find_horizontal_offset_by_body_fusion(top_frame: np.ndarray, bot_frame: np.ndarray, top_wl: int, bot_wl: int, top_expand: int, bot_expand: int) -> float:
+def find_horizontal_offset_by_body_fusion(
+    top_frame: np.ndarray, bot_frame: np.ndarray, top_wl: int, bot_wl: int,
+    top_expand: int, bot_expand: int,
+    debug_dir: Path | None = None, frame_idx: int = 0
+) -> float:
+    """
+    遍历横向偏移 -80~+80 px（步长 4），找使拼接后躯干连续性最强的偏移。
+    若 debug_dir 不为空，生成中间结果截图。
+    """
     scores = {}
+    fused_samples = {}
     for offset in range(-80, 81, 4):
-        # 寻找平移位点时采用 0 像素硬切，此时最锋利的边界最有助于寻找物理结构连续性
         fused = blend_waterline_fusion(top_frame, bot_frame, top_wl, bot_wl, offset, 0, top_expand, bot_expand)
         scores[offset] = score_fused_body_similarity(fused, top_wl + top_expand)
-    return float(max(scores, key=lambda k: scores[k])) if scores else 0.0
+        fused_samples[offset] = fused
+
+    best_offset = float(max(scores, key=lambda k: scores[k])) if scores else 0.0
+
+    if debug_dir is not None:
+        _save_body_fusion_debug(
+            debug_dir, frame_idx, top_frame, bot_frame,
+            top_wl, bot_wl, top_expand, bot_expand,
+            fused_samples, scores, best_offset
+        )
+
+    return best_offset
+
+
+def _save_body_fusion_debug(
+    debug_dir: Path, frame_idx: int,
+    top_frame: np.ndarray, bot_frame: np.ndarray,
+    top_wl: int, bot_wl: int, top_expand: int, bot_expand: int,
+    fused_samples: dict[int, np.ndarray], scores: dict[int, float], best_offset: float
+) -> None:
+    try:
+        h, w = top_frame.shape[:2]
+
+        top_labeled = top_frame.copy()
+        bot_labeled = bot_frame.copy()
+        cv2.line(top_labeled, (0, int(top_wl)), (w, int(top_wl)), (0, 255, 255), 2)
+        cv2.line(top_labeled, (0, int(top_wl + top_expand)), (w, int(top_wl + top_expand)), (255, 255, 0), 1)
+        cv2.putText(top_labeled, f"top_wl={int(top_wl)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+        cv2.line(bot_labeled, (0, int(bot_wl)), (w, int(bot_wl)), (0, 255, 255), 2)
+        cv2.line(bot_labeled, (0, int(bot_wl + bot_expand)), (w, int(bot_wl + bot_expand)), (255, 255, 0), 1)
+        cv2.putText(bot_labeled, f"bot_wl={int(bot_wl)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+        side_by_side = np.hstack([top_labeled, bot_labeled])
+        cv2.imwrite(str(debug_dir / f"frame_{frame_idx:03d}_00_src.jpg"), cv2.cvtColor(side_by_side, cv2.COLOR_RGB2BGR))
+
+        best_offset_int = int(round(best_offset))
+        sorted_offsets = sorted(scores.keys())
+        candidates = [best_offset_int]
+        for o in sorted_offsets:
+            if o not in candidates and abs(o - best_offset_int) >= 16:
+                candidates.append(o)
+                if len(candidates) >= 5:
+                    break
+        candidates = sorted(set(candidates))
+
+        fusion_rows = []
+        for offset in candidates:
+            fused = fused_samples[offset]
+            label = f"off={offset:+d}  score={scores[offset]:.2f}"
+            labeled = fused.copy()
+            seam_y = int(top_wl + top_expand)
+            cv2.line(labeled, (0, seam_y), (int(labeled.shape[1]), seam_y), (0, 255, 0), 2)
+            cv2.putText(labeled, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 255, 0) if offset == best_offset_int else (200, 200, 200), 2)
+            fusion_rows.append(labeled)
+
+        if fusion_rows:
+            fusion_grid = np.vstack(fusion_rows)
+            cv2.imwrite(str(debug_dir / f"frame_{frame_idx:03d}_01_fusions.jpg"), cv2.cvtColor(fusion_grid, cv2.COLOR_RGB2BGR))
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        xs, ys = zip(*sorted(scores.items()))
+        ax.plot(xs, ys, 'b-o', linewidth=1.5, markersize=4)
+        ax.axvline(float(best_offset_int), color='r', linestyle='--', label=f'best={best_offset_int}')
+        ax.scatter([float(best_offset_int)], [float(scores[best_offset_int])], color='r', zorder=5, s=80)
+        ax.set_title(f'body_fusion score vs horizontal_offset  (frame={int(frame_idx)})')
+        ax.set_xlabel('horizontal_offset (px)')
+        ax.set_ylabel('similarity score')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.savefig(str(debug_dir / f"frame_{frame_idx:03d}_02_scores.png"), dpi=100, bbox_inches='tight')
+        plt.close(fig)
+    except Exception:
+        import traceback; traceback.print_exc()
+
 
 def compute_spatial_alignment_10x4(
-    top_vid: Path, bot_vid: Path, 
-    time_offset: float, 
-    top_rot: bool, bot_rot: bool, 
+    top_vid: Path, bot_vid: Path,
+    time_offset: float,
+    top_rot: bool, bot_rot: bool,
     top_zoom_factor: float = 1.0,
-    top_expand: int = 20, bot_expand: int = 20
+    top_expand: int = 20, bot_expand: int = 20,
+    debug_dir: Path | None = None
 ) -> tuple[int, int, int]:
     meta_t, meta_b = load_video_meta(top_vid), load_video_meta(bot_vid)
     ov_start, ov_end = 0.0, min(meta_t.duration, meta_b.duration - time_offset)
@@ -367,19 +432,14 @@ def compute_spatial_alignment_10x4(
     seg_dur = (ov_end - ov_start) / 10.0
     sample_times = [ov_start + (i + 0.5) * seg_dur + offset * (1.0 / meta_t.fps) for i in range(10) for offset in range(4)]
 
-    model_dir = Path.home() / ".mediapipe" / "models"
-    model_path = model_dir / "pose_landmarker_lite.task"
-    options = PoseLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)), running_mode=PoseLandmarkerOptions.running_mode.IMAGE)
-    landmarker = PoseLandmarker.create_from_options(options)
-
     t_reader, b_reader = iio.get_reader(str(top_vid)), iio.get_reader(str(bot_vid))
-    wl_tops, wl_bots, x_offsets_mediapipe, x_offsets_edge, x_offsets_body_fusion = [], [], [], [], []
+    wl_tops, wl_bots, x_offsets_body_fusion = [], [], []
 
-    for t in sample_times:
+    for frame_idx, t in enumerate(sample_times):
         tf, bf = sample_frame_at(t_reader, t, meta_t.fps), sample_frame_at(b_reader, max(0.0, t + time_offset), meta_b.fps)
         if tf is None or bf is None: continue
         tf, bf = rotate_frame(tf, top_rot), rotate_frame(bf, bot_rot)
-        
+
         if top_zoom_factor != 1.0:
             tf = apply_top_zoom(tf, top_zoom_factor)
 
@@ -390,31 +450,24 @@ def compute_spatial_alignment_10x4(
         if wt is not None: wl_tops.append(wt)
         if wb is not None: wl_bots.append(wb)
 
-        res_t = landmarker.detect(Image(image_format=ImageFormat.SRGB, data=tf))
-        res_b = landmarker.detect(Image(image_format=ImageFormat.SRGB, data=bf))
-        if res_t.pose_landmarks and res_b.pose_landmarks and \
-           res_t.pose_landmarks[0][PoseLandmark.NOSE].visibility > 0.3 and res_b.pose_landmarks[0][PoseLandmark.NOSE].visibility > 0.3:
-            x_offsets_mediapipe.append(res_t.pose_landmarks[0][PoseLandmark.NOSE].x * tf.shape[1] - res_b.pose_landmarks[0][PoseLandmark.NOSE].x * bf.shape[1])
-
         if wt is not None and wb is not None:
-            if (e_off := find_horizontal_offset_by_edge_correlation(tf, bf, wt, wb)) != 0.0: x_offsets_edge.append(e_off)
-            if (b_off := find_horizontal_offset_by_body_fusion(tf, bf, wt, wb, top_expand, bot_expand)) != 0.0: x_offsets_body_fusion.append(b_off)
+            try:
+                b_off = find_horizontal_offset_by_body_fusion(tf, bf, wt, wb, top_expand, bot_expand, debug_dir, frame_idx)
+                if b_off != 0.0:
+                    x_offsets_body_fusion.append(b_off)
+            except Exception:
+                import traceback; traceback.print_exc()
 
-    landmarker.close(); t_reader.close(); b_reader.close()
+    t_reader.close(); b_reader.close()
     if not wl_tops or not wl_bots: raise ValueError("未能识别到相机的水位线")
-    
-    available = [n for n, v in [('body_fusion', x_offsets_body_fusion), ('waterline_edge', x_offsets_edge), ('mediapipe_nose', x_offsets_mediapipe)] if v]
-    if not available:
+
+    if not x_offsets_body_fusion:
         x_offsets = _fallback_by_motion_centroid(top_vid, bot_vid, time_offset, top_rot, bot_rot, meta_t, meta_b, top_zoom_factor)
     else:
-        all_medians = [float(np.median(v)) for n, v in [('body_fusion', x_offsets_body_fusion), ('waterline_edge', x_offsets_edge), ('mediapipe_nose', x_offsets_mediapipe)] if v]
-        h_offset_raw = float(np.median(all_medians))
-        if len(all_medians) >= 2:
-            q1, q3 = np.percentile(sorted(all_medians), [25, 75])
-            if clipped := [m for m in all_medians if abs(m - h_offset_raw) <= 1.5 * max(q3 - q1, 1.0) + 5]: h_offset_raw = float(np.median(clipped))
+        h_offset_raw = float(np.median(x_offsets_body_fusion))
         x_offsets = [h_offset_raw]
 
-    return int(np.round(np.median(x_offsets))), int(np.median(wl_tops)), int(np.median(wl_bots))
+    return int(round(float(np.median(x_offsets)))), int(np.median(wl_tops)), int(np.median(wl_bots))
 
 def _fallback_by_motion_centroid(
     top_vid: Path, bot_vid: Path, time_offset: float,
@@ -502,12 +555,15 @@ def write_fused_video_v2(top_video: Path, bottom_video: Path, cfg: FusionConfig,
 def run_full_pipeline(video_a: Path, video_b: Path, output_dir: Path, output_fps: float = 30.0, max_width: int = 1280, force_top_rotated: str = None, force_bot_rotated: str = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    debug_dir = output_dir / "debug_body_fusion"
+    debug_dir.mkdir(exist_ok=True)
+
     print(f"\n{'='*60}\n  处理: {video_a.name}  x  {video_b.name}\n{'='*60}")
 
     print("Step 1/4: 画面解析与身份辨别...")
     rot_a, rot_b, rot_a_ud, rot_b_ud = detect_rotations(video_a, video_b)
     meta_a, meta_b = load_video_meta(video_a), load_video_meta(video_b)
-    
+
     score_a = np.mean([sky_water_separation_score(f) for t in np.linspace(1, min(meta_a.duration, 10), 6) if (f:=sample_frame_at((r:=iio.get_reader(str(video_a))), t, meta_a.fps)) is not None and not r.close()])
     score_b = np.mean([sky_water_separation_score(f) for t in np.linspace(1, min(meta_b.duration, 10), 6) if (f:=sample_frame_at((r:=iio.get_reader(str(video_b))), t, meta_b.fps)) is not None and not r.close()])
 
@@ -523,15 +579,17 @@ def run_full_pipeline(video_a: Path, video_b: Path, output_dir: Path, output_fps
     time_offset, strategies = compute_audio_time_offset(top_video, bottom_video)
     print(f"   => 成功。水下相对水上时间偏移: {time_offset:.4f} 秒")
 
-    print("Step 3/4: 10段x4帧空间定标 (环境物理水位线 + AI 头部追踪对齐) ...")
+    print("Step 3/4: 10段x4帧空间定标 (身体融合相似度算法 + 运动质心 Fallback) ...")
     h_offset, top_wl, bot_wl = compute_spatial_alignment_10x4(
-        top_video, bottom_video, time_offset, top_rot, bot_rot, 
-        TOP_ZOOM_FACTOR, TOP_WATERLINE_OFFSET, BOTTOM_WATERLINE_OFFSET
+        top_video, bottom_video, time_offset, top_rot, bot_rot,
+        TOP_ZOOM_FACTOR, TOP_WATERLINE_OFFSET, BOTTOM_WATERLINE_OFFSET,
+        debug_dir=debug_dir
     )
     print(f"   => 放大倍率: {TOP_ZOOM_FACTOR}x")
-    print(f"   => 横向偏移对齐: {h_offset} px")
-    print(f"   => 物理水面上切线: {top_wl} px, 扩展后保留至 {top_wl + TOP_WATERLINE_OFFSET} px")
-    print(f"   => 物理水面下切线: {bot_wl} px, 扩展后保留至 {bot_wl - BOTTOM_WATERLINE_OFFSET} px")
+    print(f"   => 横向偏移对齐: {int(h_offset)} px")
+    print(f"   => 物理水面上切线: {int(top_wl)} px, 扩展后保留至 {int(top_wl) + int(TOP_WATERLINE_OFFSET)} px")
+    print(f"   => 物理水面下切线: {int(bot_wl)} px, 扩展后保留至 {int(bot_wl) - int(BOTTOM_WATERLINE_OFFSET)} px")
+    print(f"   => 调试截图已保存: {debug_dir}")
 
     print("Step 4/4: 全局静态切片物理重构并渲染...")
     cfg = FusionConfig(
@@ -572,7 +630,9 @@ def run_batch_pipeline(top_dir: Path, bottom_dir: Path, output_dir: Path, output
             report = run_full_pipeline(top_video, bottom_video, pair_out, output_fps, max_width)
             report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             paired += 1
-        except Exception as e: print(e)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"   [错误] {type(e).__name__}: {e}")
     print(f"\n配对完成: {paired} 已融合, {skipped} 已跳过（存在报告文件）")
     return results
 
