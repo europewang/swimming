@@ -10,3 +10,32 @@ video_merge/
 *.png
 *.wav
 yolov8n-seg.pt
+
+# IDE / local machine files
+.idea/
+.vscode/
+*.iml
+
+# Android / Gradle generated files
+.gradle/
+build/
+**/.gradle/
+**/build/
+local.properties
+*.apk
+*.ap_
+
+# Large local videos and generated media
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+
+# Exported model artifacts kept locally, not in git history
+*.pt
+*.onnx
+*.npy
+*_saved_model/
+dji_meta.bin

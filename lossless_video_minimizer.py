@@ -1,3 +1,18 @@
+"""
+lossless_video_minimizer.py
+纯净极速视频压缩
+
+使用方法：
+python lossless_video_minimizer.py <输入文件夹> [--output-dir <输出文件夹>] [--recursive] [--overwrite] [--ffmpeg <ffmpeg路径>]
+
+参数：
+- <输入文件夹>：视频文件夹
+- --output-dir <输出文件夹>：输出文件夹
+- --recursive：递归处理子目录
+
+eg:
+python lossless_video_minimizer.py video\video1 --output-dir video_merge\video1_min
+"""
 from __future__ import annotations
 import argparse
 import shutil
